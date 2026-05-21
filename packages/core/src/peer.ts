@@ -1,12 +1,21 @@
-import {all, alloc, candidateType, resetTimer, toError} from './utils'
+import {alloc, candidateType, resetTimer, toError} from './utils'
 import type {BaseRoomConfig, PeerHandle, PeerHandlers, Signal} from './types'
-import {Effect, Exit, flow, pipe, Result, Scope} from 'effect'
+import {
+  Context,
+  Effect,
+  Exit,
+  flow,
+  Match,
+  Option,
+  pipe,
+  Result,
+  Scope,
+  Stream
+} from 'effect'
 import * as RtcPeerConnection from './webrtc/RtcPeerConnection'
 
 const iceTimeout = 15_000
 const disconnectedCloseDelayMs = 5_000
-const iceStateEvent = 'icegatheringstatechange'
-const iceConnectionStateEvent = 'iceconnectionstatechange'
 const offerType = 'offer'
 const answerType = 'answer'
 const outOfRangePattern = /out of range/i
@@ -34,11 +43,12 @@ export default (
     iceServers: defaultIceServers.concat(turnConfig ?? [])
   }
   const scope = Scope.makeUnsafe()
+  const handleScope = Context.make(Scope.Scope, scope)
   const pc = pipe(
     rtcPolyfill
       ? RtcPeerConnection.makePolyFill(rtcPolyfill, rtcConfig)
       : RtcPeerConnection.makeGlobalThis(rtcConfig),
-    Effect.provideService(Scope.Scope, scope),
+    Effect.provideContext(handleScope),
     Effect.runSync
   )
   /** wip refactor handle to raw PeerConnection */
@@ -122,20 +132,6 @@ export default (
     type: (peerConnection.localDescription?.type ?? offerType) as RTCSdpType,
     sdp: normalizeSdp(peerConnection.localDescription?.sdp ?? '')
   })
-  /** @deprecated */
-  const _getRemoteUfrag = (): string | null => {
-    const sdp = _pc.remoteDescription?.sdp
-
-    if (!sdp) {
-      return null
-    }
-
-    const match = sdp.match(/a=ice-ufrag:([^\s]+)/)
-    return match?.[1] ?? null
-  }
-  /** @deprecated */
-  const _getRemoteMediaSectionCount = (): number =>
-    (_pc.remoteDescription?.sdp?.match(/^m=/gm) ?? []).length
 
   const canApplyRemoteCandidate = function (
     remoteDesc: RTCSessionDescription,
@@ -170,25 +166,7 @@ export default (
 
     return true
   }
-  /** @deprecated */
-  const addIceCandidateSafe = async (
-    candidate: RTCIceCandidateInit
-  ): Promise<boolean> => {
-    try {
-      await _pc.addIceCandidate(candidate)
-      return true
-    } catch (err) {
-      if (
-        err instanceof Error &&
-        outOfRangePattern.test(err.message) &&
-        typeof candidate.sdpMLineIndex === 'number'
-      ) {
-        return false
-      }
 
-      throw err
-    }
-  }
   const addIceCandidate = Effect.fnUntraced(function* (
     candidate: RTCIceCandidateInit
   ) {
@@ -213,32 +191,7 @@ export default (
       )
     )
   })
-  /** @deprecated */
-  const _flushPendingRemoteCandidates = async (): Promise<void> => {
-    if (!_pc.remoteDescription || pendingRemoteCandidates.length === 0) {
-      return
-    }
 
-    const queuedCandidates = pendingRemoteCandidates.splice(0)
-    const stillPending: RTCIceCandidateInit[] = []
-
-    for (const candidate of queuedCandidates) {
-      if (!canApplyRemoteCandidate(_pc.remoteDescription!, candidate)) {
-        stillPending.push(candidate)
-        continue
-      }
-
-      const didApply = await addIceCandidateSafe(candidate)
-
-      if (!didApply) {
-        stillPending.push(candidate)
-      }
-    }
-
-    if (stillPending.length > 0) {
-      pendingRemoteCandidates.push(...stillPending)
-    }
-  }
   const flushPendingRemoteCandidates = Effect.gen(function* () {
     const remoteDesc = yield* pc.remoteDescription
     if (!remoteDesc || pendingRemoteCandidates.length === 0) {
@@ -265,21 +218,6 @@ export default (
     }
   })
 
-  /** @deprecated */
-  const _addRemoteCandidate = async (
-    candidate: RTCIceCandidateInit
-  ): Promise<void> => {
-    if (canApplyRemoteCandidate(_pc.remoteDescription!, candidate)) {
-      const didApply = await addIceCandidateSafe(candidate)
-
-      if (!didApply) {
-        pendingRemoteCandidates.push(candidate)
-      }
-      return
-    }
-
-    pendingRemoteCandidates.push(candidate)
-  }
   const addRemoteCandidate = Effect.fnUntraced(function* (
     candidate: RTCIceCandidateInit
   ) {
@@ -311,44 +249,7 @@ export default (
     channel.onerror = ({error}) =>
       handlers.error?.(toError(error, 'data channel error'))
   }
-  /** @deprecated */
-  const _waitForIceGathering = async (
-    peerConnection: RTCPeerConnection
-  ): Promise<SdpDescription> => {
-    let timeout: ReturnType<typeof setTimeout> | null = null
 
-    try {
-      await Promise.race([
-        new Promise<void>(res => {
-          const checkState = (): void => {
-            if (peerConnection.iceGatheringState === 'complete') {
-              peerConnection.removeEventListener(iceStateEvent, checkState)
-              res()
-            }
-          }
-
-          peerConnection.addEventListener(iceStateEvent, checkState)
-          checkState()
-        }),
-        new Promise<void>(res => {
-          timeout = setTimeout(res, iceTimeout)
-        })
-      ])
-    } finally {
-      resetTimer(timeout)
-    }
-
-    return localDescriptionSignal(peerConnection)
-  }
-  /** @deprecated */
-  const _emitLocalDescriptionSignal = async (): Promise<SdpDescription> => {
-    const signal = shouldTrickleIce
-      ? localDescriptionSignal(_pc)
-      : await _waitForIceGathering(_pc)
-
-    emitSignal(signal)
-    return signal
-  }
   const emitLocalDescriptionSignal = (
     shouldTrickleIce: boolean
   ): Effect.Effect<SdpDescription> =>
@@ -368,49 +269,6 @@ export default (
       return signal
     })
 
-  if (initiator) {
-    dataChannel = _pc.createDataChannel('data')
-    setupDataChannel(dataChannel)
-  } else {
-    _pc.ondatachannel = ({channel}) => {
-      dataChannel = channel
-      setupDataChannel(channel)
-    }
-  }
-  /** @deprecated */
-  const _createOffer = async (restartIce = false): Promise<Signal | void> => {
-    if (_pc.connectionState === 'closed') {
-      return
-    }
-
-    try {
-      makingOffer = true
-
-      if (restartIce) {
-        if (
-          _pc.signalingState !== 'stable' &&
-          _pc.signalingState !== 'closed' &&
-          _pc.localDescription?.type === offerType
-        ) {
-          await _pc.setLocalDescription({type: 'rollback'})
-        }
-
-        if (typeof _pc.restartIce === 'function') {
-          _pc.restartIce()
-        }
-      }
-
-      await _pc.setLocalDescription(
-        restartIce ? await _pc.createOffer({iceRestart: true}) : undefined
-      )
-      const offer = await _emitLocalDescriptionSignal()
-      return offer
-    } catch (err) {
-      handlers.error?.(toError(err, 'failed to create local offer'))
-    } finally {
-      makingOffer = false
-    }
-  }
   /** Initiates offer signal */
   const createOffer: (
     restartIce?: boolean
@@ -420,19 +278,19 @@ export default (
       RtcPeerConnection.RtcPeerConnectionError | 'ConnectionClosed'
     >
   > = Effect.fnUntraced(function* (restartIce = false) {
-    if (_pc.connectionState === 'closed') {
+    if ((yield* pc.connectionState) === 'closed') {
       return Result.fail('ConnectionClosed')
     }
     const offerResult = yield* Effect.result(
       Effect.gen(function* () {
         makingOffer = true
-        if (
-          _pc.signalingState !== 'stable' &&
-          _pc.signalingState !== 'closed' &&
-          _pc.localDescription?.type === offerType
-        ) {
-          yield* pc.setLocalDescription({type: 'rollback'})
-        }
+        yield* pc.useUnsafe(({signalingState, localDescription}) =>
+          signalingState !== 'stable' &&
+          signalingState !== 'closed' &&
+          localDescription?.type === offerType
+            ? pc.setLocalDescription({type: 'rollback'})
+            : Effect.void
+        )
         if (restartIce) {
           yield* pc.restartIce
           return yield* pipe(
@@ -455,95 +313,116 @@ export default (
     })
   })
 
-  _pc.onnegotiationneeded = async () => Effect.runPromise(createOffer(false))
+  const onNegotiationNeeded = createOffer(false)
 
-  _pc.onicecandidate = ({candidate}) => {
-    if (!shouldTrickleIce || !candidate) {
-      return
-    }
-
-    const candidatePayload = normalizeCandidate(
-      typeof candidate.toJSON === 'function'
-        ? candidate.toJSON()
-        : {
-            candidate: candidate.candidate,
-            sdpMid: candidate.sdpMid,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-            usernameFragment: candidate.usernameFragment
+  Effect.runSyncWith(handleScope)(
+    Effect.gen(function* () {
+      if (initiator) {
+        dataChannel = yield* pc.createDataChannel('data')
+        setupDataChannel(dataChannel)
+      }
+      yield* pc.useUnsafe(pc =>
+        Effect.sync(() => {
+          // note: due to task scheduling issues with Queue backed streams and the room handler callbacks,
+          // we need to ensure early track/datachannel event callbacks are ran in the same event loop as this peer handle's constructor
+          if (!initiator) {
+            pc.addEventListener('datachannel', ({channel}) => {
+              dataChannel = channel
+              setupDataChannel(channel)
+            })
           }
-    )
+          pc.addEventListener('track', e => {
+            const stream = e.streams[0]
+            if (stream) {
+              if (!handlers.track && !handlers.stream) {
+                pendingTracks.push({track: e.track, stream})
+                return
+              }
 
-    emitSignal({
-      type: candidateType,
-      sdp: JSON.stringify(candidatePayload)
+              handlers.track?.(e.track, stream)
+              handlers.stream?.(stream)
+            }
+          })
+        })
+      )
+      yield* Effect.forkScoped(
+        pipe(
+          RtcPeerConnection.makeStreamFromEventListeners(pc, [
+            'negotiationneeded',
+            'icecandidate',
+            'connectionstatechange',
+            'removestream'
+          ]),
+          Stream.mapEffect(event =>
+            Match.value(event).pipe(
+              Match.tagsExhaustive({
+                negotiationneeded: () => onNegotiationNeeded,
+                icecandidate: ({candidate}) =>
+                  Effect.gen(function* () {
+                    yield* Effect.void
+                    if (!shouldTrickleIce || !candidate) {
+                      return
+                    }
+                    const candidatePayload = normalizeCandidate(
+                      typeof candidate.toJSON === 'function' // for polyfills??
+                        ? candidate.toJSON()
+                        : {
+                            candidate: candidate.candidate,
+                            sdpMid: candidate.sdpMid,
+                            sdpMLineIndex: candidate.sdpMLineIndex,
+                            usernameFragment: candidate.usernameFragment
+                          }
+                    )
+                    emitSignal({
+                      type: candidateType,
+                      sdp: JSON.stringify(candidatePayload)
+                    })
+                  }),
+                connectionstatechange: () =>
+                  Effect.map(pc.connectionState, state =>
+                    pipe(
+                      Match.value(state),
+                      Match.when('new', () => {}),
+                      Match.whenOr(
+                        'connected',
+                        'connecting',
+                        clearDisconnectedCloseTimer
+                      ),
+                      Match.whenOr('failed', 'closed', emitClose),
+                      Match.when('disconnected', () => {
+                        if (!disconnectedCloseTimer) {
+                          disconnectedCloseTimer = setTimeout(() => {
+                            disconnectedCloseTimer = null
+                            const state = pc.connectionState.pipe(
+                              Effect.runSync
+                            )
+                            if (state === 'disconnected') {
+                              emitClose()
+                            }
+                          }, disconnectedCloseDelayMs)
+                        }
+                      }),
+                      Match.exhaustive
+                    )
+                  ),
+                /** todo: remove
+                 * wiki says "Instead of listening for this obsolete event, you should listen for removetrack events on each stream."
+                 */
+                removestream: event =>
+                  Effect.sync(() =>
+                    event.stream ? handlers.stream?.(event.stream) : undefined
+                  )
+              })
+            )
+          ),
+          Stream.runDrain
+        ).pipe(),
+        {startImmediately: true}
+      )
     })
-  }
-  _pc.onconnectionstatechange = () => {
-    if (
-      _pc.connectionState === 'failed' ||
-      _pc.connectionState === 'closed' ||
-      _pc.iceConnectionState === 'failed' ||
-      _pc.iceConnectionState === 'closed'
-    ) {
-      emitClose()
-      return
-    }
-
-    if (
-      _pc.connectionState === 'connected' ||
-      _pc.connectionState === 'connecting' ||
-      _pc.iceConnectionState === 'connected' ||
-      _pc.iceConnectionState === 'completed' ||
-      _pc.iceConnectionState === 'checking'
-    ) {
-      clearDisconnectedCloseTimer()
-      return
-    }
-
-    if (
-      _pc.connectionState === 'disconnected' ||
-      _pc.iceConnectionState === 'disconnected'
-    ) {
-      if (!disconnectedCloseTimer) {
-        disconnectedCloseTimer = setTimeout(() => {
-          disconnectedCloseTimer = null
-
-          if (
-            _pc.connectionState === 'disconnected' ||
-            _pc.iceConnectionState === 'disconnected'
-          ) {
-            emitClose()
-          }
-        }, disconnectedCloseDelayMs)
-      }
-
-      return
-    }
-  }
-
-  // pc.onconnectionstatechange = handleConnectionStateChange
-  // pc.addEventListener(iceConnectionStateEvent, handleConnectionStateChange)
-
-  _pc.ontrack = e => {
-    const stream = e.streams[0]
-
-    if (stream) {
-      if (!handlers.track && !handlers.stream) {
-        pendingTracks.push({track: e.track, stream})
-        return
-      }
-
-      handlers.track?.(e.track, stream)
-      handlers.stream?.(stream)
-    }
-  }
-  ;(
-    _pc as RTCPeerConnection & {
-      onremovestream: ((e: {stream: MediaStream}) => void) | null
-    }
-  ).onremovestream = e => handlers.stream?.(e.stream)
-
-  const offerPromise = initiator
+  )
+  /** @deprecated */
+  const _offerPromise = initiator
     ? new Promise<Signal | void>(res =>
         appendSignalHandler(signal => {
           if (signal.type === offerType) {
@@ -553,30 +432,48 @@ export default (
       )
     : Promise.resolve()
 
+  const offerPromise = Effect.callback<Signal | void>(res =>
+    initiator
+      ? appendSignalHandler(signal => {
+          if (signal.type === offerType) {
+            res(Effect.succeed(signal))
+          }
+        })
+      : res(Effect.void)
+  )
+
   if (initiator) {
     queueMicrotask(() => {
-      if (
-        !makingOffer &&
-        _pc.signalingState === 'stable' &&
-        !_pc.localDescription &&
-        _pc.connectionState !== 'closed'
-      ) {
-        void _pc.onnegotiationneeded?.(new Event('negotiationneeded'))
-      }
+      Effect.runPromise(
+        pc.useUnsafe(pc => {
+          if (
+            !makingOffer &&
+            pc.signalingState === 'stable' &&
+            !pc.localDescription &&
+            pc.connectionState !== 'closed'
+          ) {
+            return onNegotiationNeeded
+          }
+          return Effect.void
+        })
+      )
     })
   }
 
   return {
     created: Date.now(),
 
-    connection: _pc,
+    connection: pc.useUnsafe(Effect.succeed).pipe(Effect.runSync),
 
     get channel(): RTCDataChannel | null {
       return dataChannel
     },
 
     get isDead(): boolean {
-      return _pc.connectionState === 'closed'
+      return pc.connectionState.pipe(
+        Effect.map(state => state === 'closed'),
+        Effect.runSync
+      )
     },
 
     getOffer: async (restartIce = false): Promise<Signal | void> =>
@@ -587,7 +484,7 @@ export default (
         if (restartIce) {
           yield* createOffer(true)
         }
-        if (_pc.localDescription?.type === offerType) {
+        if ((yield* pc.localDescription)?.type === offerType) {
           const signalFromLocalDesc = pc.useUnsafe(
             flow(localDescriptionSignal, Effect.succeed)
           )
@@ -601,34 +498,31 @@ export default (
           )
           return offeredSignal
         }
-        return yield* Effect.promise(() => offerPromise)
+        return yield* offerPromise
       }).pipe(Effect.runPromise),
 
     async signal(sdp: Signal): Promise<Signal | void> {
-      if (sdp.type === candidateType) {
-        try {
-          const candidate = JSON.parse(sdp.sdp) as RTCIceCandidateInit | null
-
+      return Effect.gen(function* () {
+        if (sdp.type === candidateType) {
+          const candidate = yield* Effect.try({
+            try: () => JSON.parse(sdp.sdp) as RTCIceCandidateInit | null,
+            catch: err => {
+              handlers.error?.(toError(err, 'failed to parse remote candidate'))
+            }
+          })
           if (candidate && typeof candidate === 'object') {
-            await Effect.runPromise(
-              addRemoteCandidate(normalizeCandidate(candidate))
-            )
+            yield* addRemoteCandidate(normalizeCandidate(candidate))
           }
-        } catch (err) {
-          handlers.error?.(toError(err, 'failed to parse remote candidate'))
+          return
         }
 
-        return
-      }
+        if (
+          dataChannel?.readyState === 'open' &&
+          !sdp.sdp?.includes('a=rtpmap')
+        ) {
+          return
+        }
 
-      if (
-        dataChannel?.readyState === 'open' &&
-        !sdp.sdp?.includes('a=rtpmap')
-      ) {
-        return
-      }
-
-      try {
         const rtcSdp: RTCSessionDescriptionInit = {
           ...sdp,
           sdp: normalizeSdp(sdp.sdp)
@@ -637,42 +531,47 @@ export default (
         if (sdp.type === offerType) {
           if (
             makingOffer ||
-            (_pc.signalingState !== 'stable' && !isSettingRemoteAnswerPending)
+            ((yield* pc.signalingState) !== 'stable' &&
+              !isSettingRemoteAnswerPending)
           ) {
             if (initiator) {
               return
             }
 
-            await all([
-              _pc.setLocalDescription({type: 'rollback'}),
-              _pc.setRemoteDescription(rtcSdp)
+            yield* Effect.all([
+              pc.setLocalDescription({type: 'rollback'}),
+              pc.setRemoteDescription(rtcSdp)
             ])
           } else {
-            await _pc.setRemoteDescription(rtcSdp)
+            yield* pc.setRemoteDescription(rtcSdp)
           }
 
-          await Effect.runPromise(flushPendingRemoteCandidates)
-          await _pc.setLocalDescription()
-          const answer = await Effect.runPromise(
-            emitLocalDescriptionSignal(shouldTrickleIce)
-          )
-
+          yield* flushPendingRemoteCandidates
+          yield* pc.setLocalDescription()
+          const answer = yield* emitLocalDescriptionSignal(shouldTrickleIce)
           return answer
         }
 
         if (sdp.type === answerType) {
           isSettingRemoteAnswerPending = true
-
-          try {
-            await _pc.setRemoteDescription(rtcSdp)
-            await Effect.runPromise(flushPendingRemoteCandidates)
-          } finally {
-            isSettingRemoteAnswerPending = false
-          }
+          yield* Effect.all([
+            pc.setRemoteDescription(rtcSdp),
+            flushPendingRemoteCandidates
+          ]).pipe(
+            Effect.onExit(() =>
+              Effect.sync(() => (isSettingRemoteAnswerPending = false))
+            )
+          )
         }
-      } catch (err) {
-        handlers.error?.(toError(err, 'failed to apply remote signal'))
-      }
+        return yield* Effect.void
+      }).pipe(
+        Effect.tapError(err =>
+          Effect.sync(() =>
+            handlers.error?.(toError(err, 'failed to apply remote signal'))
+          )
+        ),
+        Effect.runPromise
+      )
     },
 
     sendData: data => dataChannel?.send(data as unknown as never),
@@ -708,38 +607,30 @@ export default (
       }
     },
 
-    offerPromise,
+    offerPromise: offerPromise.pipe(Effect.runPromise),
 
-    addStream: stream =>
-      stream.getTracks().forEach(track => _pc.addTrack(track, stream)),
+    addStream: stream => pc.addStream(stream).pipe(Effect.runSync),
 
-    removeStream: stream =>
-      _pc
-        .getSenders()
-        .filter(
-          sender => sender.track && stream.getTracks().includes(sender.track)
-        )
-        .forEach(sender => _pc.removeTrack(sender)),
+    removeStream: stream => pc.removeStream(stream).pipe(Effect.runSync),
 
-    addTrack: (track, stream) => _pc.addTrack(track, stream),
+    addTrack: (track, stream) =>
+      pc.addTrack(track, stream).pipe(Effect.runSync),
 
-    removeTrack: track => {
-      const sender = _pc.getSenders().find(s => s.track === track)
+    removeTrack: (track: MediaStreamTrack) =>
+      pipe(
+        pc.getSenders,
+        Effect.map(senders => senders.find(s => s.track === track)),
+        Effect.map(Option.fromUndefinedOr),
+        Effect.map(Option.map(sender => pc.removeTrack(sender))),
+        Effect.runSync
+      ),
 
-      if (sender) {
-        _pc.removeTrack(sender)
-      }
-    },
-
-    replaceTrack: (oldTrack, newTrack) => {
-      const sender = _pc.getSenders().find(s => s.track === oldTrack)
-
-      if (sender) {
-        return sender.replaceTrack(newTrack)
-      }
-
-      return undefined
-    }
+    replaceTrack: (oldTrack, newTrack) =>
+      pipe(
+        pc.replaceTrack(oldTrack, newTrack),
+        Effect.asVoid,
+        Effect.runPromise
+      )
   }
 }
 
