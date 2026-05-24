@@ -1,13 +1,14 @@
-import {alloc, candidateType, resetTimer, toError} from './utils'
+import {alloc, candidateType, toError} from './utils'
 import type {BaseRoomConfig, PeerHandle, PeerHandlers, Signal} from './types'
 import {
-  Context,
   Effect,
   Exit,
+  Fiber,
   flow,
   Match,
   Option,
   pipe,
+  Ref,
   Result,
   Scope,
   Stream
@@ -28,7 +29,14 @@ type SdpDescription = {
 const rewriteMdnsCandidatesToLoopback = (sdp: string): string =>
   sdp.replace(/ (\S+\.local) (\d+) typ host/g, ' 127.0.0.1 $2 typ host')
 
-export default (
+const make: (
+  initiator: boolean,
+  config: BaseRoomConfig
+) => Effect.Effect<
+  PeerHandle,
+  RtcPeerConnection.RtcPeerConnectionError,
+  Scope.Scope
+> = Effect.fnUntraced(function* (
   initiator: boolean,
   {
     trickleIce,
@@ -37,19 +45,16 @@ export default (
     turnConfig,
     _test_only_mdnsHostFallbackToLoopback
   }: BaseRoomConfig
-): PeerHandle => {
+) {
   rtcConfig = {
     ...rtcConfig,
     iceServers: defaultIceServers.concat(turnConfig ?? [])
   }
-  const scope = Scope.makeUnsafe()
-  const handleScope = Context.make(Scope.Scope, scope)
-  const pc = pipe(
+  const scope = yield* Scope.Scope
+  const pc = yield* pipe(
     rtcPolyfill
       ? RtcPeerConnection.makePolyFill(rtcPolyfill, rtcConfig)
-      : RtcPeerConnection.makeGlobalThis(rtcConfig),
-    Effect.provideContext(handleScope),
-    Effect.runSync
+      : RtcPeerConnection.makeGlobalThis(rtcConfig)
   )
   /** wip refactor handle to raw PeerConnection */
   const _pc = Effect.runSync(pc.useUnsafe(Effect.succeed))
@@ -64,11 +69,11 @@ export default (
   let makingOffer = false
   let isSettingRemoteAnswerPending = false
   let dataChannel: RTCDataChannel | null = null
-  let disconnectedCloseTimer: number | null = null
+  const disconnectedCloseTimer = yield* Ref.make<Fiber.Fiber<void> | null>(null)
   let didEmitClose = false
 
   const clearDisconnectedCloseTimer = (): null =>
-    (disconnectedCloseTimer = resetTimer(disconnectedCloseTimer))
+    Ref.getUnsafe(disconnectedCloseTimer)?.interruptUnsafe() ?? null
 
   const emitClose = (): void => {
     if (didEmitClose) {
@@ -79,6 +84,15 @@ export default (
     clearDisconnectedCloseTimer()
     handlers.close?.()
   }
+
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      dataChannel?.close()
+      makingOffer = false
+      isSettingRemoteAnswerPending = false
+      emitClose()
+    })
+  )
 
   const emitSignal = (signal: Signal): void => {
     if (handlers.signal) {
@@ -315,165 +329,115 @@ export default (
 
   const onNegotiationNeeded = createOffer(false)
 
-  Effect.runSyncWith(handleScope)(
-    Effect.gen(function* () {
-      if (initiator) {
-        dataChannel = yield* pc.createDataChannel('data')
-        setupDataChannel(dataChannel)
-      }
-      yield* pc.useUnsafe(pc =>
-        Effect.sync(() => {
-          // note: due to task scheduling issues with Queue backed streams and the room handler callbacks,
-          // we need to ensure early track/datachannel event callbacks are ran in the same event loop as this peer handle's constructor
-          if (!initiator) {
-            pc.addEventListener('datachannel', ({channel}) => {
-              dataChannel = channel
-              setupDataChannel(channel)
-            })
-          }
-          pc.addEventListener('track', e => {
-            const stream = e.streams[0]
-            if (stream) {
-              if (!handlers.track && !handlers.stream) {
-                pendingTracks.push({track: e.track, stream})
-                return
-              }
+  if (initiator) {
+    dataChannel = yield* pc.createDataChannel('data')
+    setupDataChannel(dataChannel)
+  }
 
-              handlers.track?.(e.track, stream)
-              handlers.stream?.(stream)
-            }
-          })
+	// note: due to task scheduling issues with Queue backed streams and the room handler callbacks,
+	// we need to ensure early track/datachannel event callbacks are ran in the same event loop as this peer handle's constructor
+  yield* pc.useUnsafe(pc =>
+    Effect.sync(() => {
+      if (!initiator) {
+        pc.addEventListener('datachannel', ({channel}) => {
+          dataChannel = channel
+          setupDataChannel(channel)
         })
-      )
-      yield* Effect.forkScoped(
-        pipe(
-          RtcPeerConnection.makeStreamFromEventListeners(pc, [
-            'negotiationneeded',
-            'icecandidate',
-            'connectionstatechange',
-            'removestream'
-          ]),
-          Stream.mapEffect(event =>
-            Match.value(event).pipe(
-              Match.tagsExhaustive({
-                // _pc.onnegotiationneeded = async () => Effect.runPromise(createOffer(false))
-                negotiationneeded: () => onNegotiationNeeded,
-                // _pc.onicecandidate = ({candidate}) => {
-                //   if (!shouldTrickleIce || !candidate) {
-                //     return
-                //   }
+      }
+      pc.addEventListener('track', e => {
+        const stream = e.streams[0]
+        if (stream) {
+          if (!handlers.track && !handlers.stream) {
+            pendingTracks.push({track: e.track, stream})
+            return
+          }
 
-                //   const candidatePayload = normalizeCandidate(
-                //     typeof candidate.toJSON === 'function'
-                //       ? candidate.toJSON()
-                //       : {
-                //           candidate: candidate.candidate,
-                //           sdpMid: candidate.sdpMid,
-                //           sdpMLineIndex: candidate.sdpMLineIndex,
-                //           usernameFragment: candidate.usernameFragment
-                //         }
-                //   )
+          handlers.track?.(e.track, stream)
+          handlers.stream?.(stream)
+        }
+      })
+    })
+  )
 
-                //   emitSignal({
-                //     type: candidateType,
-                //     sdp: JSON.stringify(candidatePayload)
-                //   })
-                // }
-                icecandidate: ({candidate}) =>
-                  Effect.gen(function* () {
-                    yield* Effect.void
-                    if (!shouldTrickleIce || !candidate) {
-                      return
-                    }
-                    const candidatePayload = normalizeCandidate(
-                      typeof candidate.toJSON === 'function' // for polyfills??
-                        ? candidate.toJSON()
-                        : {
-                            candidate: candidate.candidate,
-                            sdpMid: candidate.sdpMid,
-                            sdpMLineIndex: candidate.sdpMLineIndex,
-                            usernameFragment: candidate.usernameFragment
-                          }
-                    )
-                    emitSignal({
-                      type: candidateType,
-                      sdp: JSON.stringify(candidatePayload)
-                    })
-                  }),
-                // _pc.onconnectionstatechange = () => {
-                //   if (
-                //     _pc.connectionState === 'connected' ||
-                //     _pc.connectionState === 'connecting'
-                //   ) {
-                //     clearDisconnectedCloseTimer()
-                //     return
-                //   }
-
-                //   if (_pc.connectionState === 'disconnected') {
-                //     if (!disconnectedCloseTimer) {
-                //       disconnectedCloseTimer = setTimeout(() => {
-                //         disconnectedCloseTimer = null
-
-                //         if (_pc.connectionState === 'disconnected') {
-                //           emitClose()
-                //         }
-                //       }, disconnectedCloseDelayMs)
-                //     }
-
-                //     return
-                //   }
-
-                //   if (_pc.connectionState === 'failed' || _pc.connectionState === 'closed') {
-                //     emitClose()
-                //   }
-                // }
-                connectionstatechange: () =>
-                  Effect.map(pc.connectionState, state =>
-                    pipe(
-                      Match.value(state),
-                      Match.when('new', () => {}),
-                      Match.whenOr(
-                        'connected',
-                        'connecting',
-                        clearDisconnectedCloseTimer
-                      ),
-                      Match.whenOr('failed', 'closed', emitClose),
-                      Match.when('disconnected', () => {
-                        if (!disconnectedCloseTimer) {
-                          disconnectedCloseTimer = setTimeout(() => {
-                            disconnectedCloseTimer = null
-                            const state = pc.connectionState.pipe(
-                              Effect.runSync
+  yield* Effect.forkScoped(
+    RtcPeerConnection.makeStreamFromEventListeners(pc, [
+      'negotiationneeded',
+      'icecandidate',
+      'connectionstatechange',
+      'removestream'
+    ]).pipe(
+      Stream.mapEffect(event =>
+        Match.value(event).pipe(
+          Match.tagsExhaustive({
+            negotiationneeded: () => onNegotiationNeeded,
+            icecandidate: ({candidate}) =>
+              Effect.gen(function* () {
+                yield* Effect.void
+                if (!shouldTrickleIce || !candidate) {
+                  return
+                }
+                const candidatePayload = normalizeCandidate(
+                  typeof candidate.toJSON === 'function' // for polyfills??
+                    ? candidate.toJSON()
+                    : {
+                        candidate: candidate.candidate,
+                        sdpMid: candidate.sdpMid,
+                        sdpMLineIndex: candidate.sdpMLineIndex,
+                        usernameFragment: candidate.usernameFragment
+                      }
+                )
+                emitSignal({
+                  type: candidateType,
+                  sdp: JSON.stringify(candidatePayload)
+                })
+              }),
+            connectionstatechange: () =>
+              Effect.andThen(pc.connectionState, state =>
+                pipe(
+                  Match.value(state),
+                  Match.when('new', () => Effect.void),
+                  Match.whenOr('connected', 'connecting', () =>
+                    Effect.sync(clearDisconnectedCloseTimer)
+                  ),
+                  Match.whenOr('failed', 'closed', () =>
+                    Effect.sync(emitClose)
+                  ),
+                  Match.when('disconnected', () =>
+                    Ref.get(disconnectedCloseTimer).pipe(isActive =>
+                      isActive
+                        ? Effect.void
+                        : Effect.gen(function* () {
+                            const fiber = yield* Effect.forkScoped(
+                              Effect.delay(
+                                Effect.andThen(pc.connectionState, state =>
+                                  state === 'disconnected'
+                                    ? Effect.sync(emitClose)
+                                    : Effect.void
+                                ),
+                                disconnectedCloseDelayMs
+                              ).pipe(
+                                Effect.onExit(() =>
+                                  Ref.set(disconnectedCloseTimer, null)
+                                )
+                              )
                             )
-                            if (state === 'disconnected') {
-                              emitClose()
-                            }
-                          }, disconnectedCloseDelayMs)
-                        }
-                      }),
-                      Match.exhaustive
+                            yield* Ref.set(disconnectedCloseTimer, fiber)
+                          })
                     )
                   ),
-                // ;(
-                //   _pc as RTCPeerConnection & {
-                //     onremovestream: ((e: {stream: MediaStream}) => void) | null
-                //   }
-                // ).onremovestream = e => handlers.stream?.(e.stream)
-                /** todo: remove
-                 * wiki says "Instead of listening for this obsolete event, you should listen for removetrack events on each stream."
-                 */
-                removestream: event =>
-                  Effect.sync(() =>
-                    event.stream ? handlers.stream?.(event.stream) : undefined
-                  )
-              })
-            )
-          ),
-          Stream.runDrain
-        ).pipe(),
-        {startImmediately: true}
-      )
-    })
+                  Match.exhaustive
+                )
+              ),
+            removestream: event =>
+              Effect.sync(() =>
+                event.stream ? handlers.stream?.(event.stream) : undefined
+              )
+          })
+        )
+      ),
+      Stream.runDrain
+    ),
+    {startImmediately: true}
   )
   /** @deprecated */
   const _offerPromise = initiator
@@ -630,14 +594,7 @@ export default (
 
     sendData: data => dataChannel?.send(data as unknown as never),
 
-    destroy: () => {
-      clearDisconnectedCloseTimer()
-      dataChannel?.close()
-      makingOffer = false
-      isSettingRemoteAnswerPending = false
-      emitClose()
-      Effect.runSync(Scope.close(scope, Exit.succeed(undefined)))
-    },
+    destroy: () => Effect.runSync(Scope.close(scope, Exit.succeed(undefined))),
 
     setHandlers: newHandlers => {
       const {signal, ...restHandlers} = newHandlers
@@ -685,8 +642,11 @@ export default (
         Effect.asVoid,
         Effect.runPromise
       )
-  }
-}
+  } satisfies PeerHandle
+})
+
+export default (...args: Parameters<typeof make>) =>
+  make(...args).pipe(Scope.provide(Scope.makeUnsafe()), Effect.runSync)
 
 export const defaultIceServers: RTCIceServer[] = [
   ...alloc(3, (_, i) => `stun:stun${i || ''}.l.google.com:19302`),
