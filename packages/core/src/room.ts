@@ -20,6 +20,7 @@ import type {
   SharedMediaPeer,
   TargetPeers
 } from './types'
+import {Effect, flow} from 'effect'
 
 const unloadEvent = 'beforeunload'
 const defaultHandshakeTimeoutMs = 10_000
@@ -57,7 +58,7 @@ type PendingPongWaiter = {
   reject: (error: Error) => void
 }
 
-export default (
+const make = Effect.fnUntraced(function* (
   onPeer: (f: (peer: PeerHandle, id: string) => void) => void,
   onPeerLeave: (id: string) => void,
   onSelfLeave: () => void,
@@ -67,7 +68,8 @@ export default (
     handshakeTimeoutMs = defaultHandshakeTimeoutMs,
     isPassive = false
   }: RoomOptions = {}
-): Room => {
+) {
+  yield* Effect.void
   const peerMap: Record<string, PeerHandle> = {}
   const activePeerMap: Record<string, PeerHandle> = {}
   const pendingPongs: Record<string, PendingPongWaiter[] | undefined> = {}
@@ -146,7 +148,6 @@ export default (
     }
 
     const wasActive = Boolean(activePeerMap[id])
-
     clearPeerState(id, reason)
     current.destroy()
 
@@ -406,5 +407,10 @@ export default (
     set onPeerTrack(handler) {
       mediaManager.onPeerTrack = handler
     }
-  }
-}
+  } satisfies Room
+})
+export default flow(make, Effect.runSync) as (
+  onPeer: (f: (peer: PeerHandle, id: string) => void) => void,
+  onPeerLeave: (id: string) => void,
+  onSelfLeave: () => void
+) => Room

@@ -1,13 +1,5 @@
 import {hashWith} from './crypto'
-import {
-  genId,
-  mkErr,
-  resetTimer,
-  selfId,
-  toError,
-  toErrorMessage,
-  toHex
-} from './utils'
+import {genId, mkErr, resetTimer, selfId, toErrorMessage, toHex} from './utils'
 import type {
   DataPayload,
   HandshakePayload,
@@ -17,6 +9,7 @@ import type {
   PeerHandle,
   PeerHandshake
 } from './types'
+import {Cause, Data, Deferred, Effect, Fiber, Match} from 'effect'
 
 const overlapRoomPasswordErr = mkErr('incorrect password for overlapping room')
 
@@ -96,7 +89,10 @@ export const createPasswordHandshake = (
 
   return {run, compose}
 }
-
+export type PeerHandshakeFiber = Fiber.Fiber<
+  void,
+  Cause.TimeoutError | PeerHandshakeFailed
+>
 type PendingPeerState = {
   peer: PeerHandle
   isActive: boolean
@@ -108,7 +104,15 @@ type PendingPeerState = {
     resolve: (payload: HandshakePayload) => void
     reject: (error: Error) => void
   }>
+  isRemoteReady: Deferred.Deferred<true>
+  handshakeFiber: PeerHandshakeFiber | null
 }
+
+export class PeerHandshakeFailed extends Data.TaggedError('HandshakeFailed')<{
+  readonly peerId: string
+  readonly peer: PeerHandle
+  readonly cause: Error
+}> {}
 
 type HandshakeManagerDeps = {
   onPeerHandshake?: PeerHandshake
@@ -187,29 +191,86 @@ export const createHandshakeManager = ({
     onFailure(id, peer, mkErr(error))
   }
 
-  const markLocalHandshakePassed = (id: string, peer: PeerHandle): void => {
+  // an effect that awaits and properly error tracks operations along the peer handshake chain
+  const makePeerHandshakeEffect = Effect.fnUntraced(function* (
+    id: string,
+    peer: PeerHandle
+  ) {
     const state = peerStates[id]
 
-    if (!state || state.peer !== peer || state.isActive) {
+    if (!state || state.peer !== peer) {
       return
     }
 
-    state.didLocalHandshakePass = true
+    const sendHandshake: HandshakeSender = async (data, metadata) => {
+      await sendHandshakeData(data, id, metadata)
+    }
 
-    void sendHandshakeReady('', id).catch(err =>
-      failPeerHandshake(
-        id,
-        peer,
-        mkErr(
-          `failed sending handshake readiness: ${toErrorMessage(
-            err,
-            'unknown send failure'
-          )}`
-        )
-      )
-    )
-    maybeActivatePeer(id, peer)
-  }
+    const receiveHandshake: HandshakeReceiver = () =>
+      new Promise<HandshakePayload>((resolve, reject) => {
+        const current = peerStates[id]
+
+        if (!current || current.peer !== peer) {
+          reject(mkErr('peer disconnected during handshake'))
+          return
+        }
+
+        const payload = current.pendingHandshakePayloads.shift()
+
+        if (payload) {
+          resolve(payload)
+          return
+        }
+
+        current.handshakeWaiters.push({
+          resolve,
+          reject: error => reject(error)
+        })
+      })
+    // wait for handshake callbacks to resolve
+    const isInitiator = selfId < id
+    if (onPeerHandshake) {
+      yield* Effect.tryPromise({
+        try: () =>
+          Promise.resolve(
+            onPeerHandshake(id, sendHandshake, receiveHandshake, isInitiator)
+          ),
+        catch: err =>
+          new PeerHandshakeFailed({
+            peerId: id,
+            peer: peer,
+            cause: mkErr(
+              `handshake process callback rejected with unknown error ${err}`
+            )
+          })
+      })
+    }
+    // send local ready signal
+    yield* Effect.tryPromise({
+      try: () => {
+        const readyPromise = sendHandshakeReady('', id)
+        const cur = peerStates[id]
+        if (cur && cur.peer === peer) {
+          cur.didLocalHandshakePass = true
+        }
+        maybeActivatePeer(id, peer) // optimistic check for local machine connections maybe?
+        return readyPromise
+      },
+      catch: err =>
+        new PeerHandshakeFailed({
+          peerId: id,
+          peer: peer,
+          cause: mkErr(
+            `handshake failed sending local readiness: ${toErrorMessage(
+              err,
+              'unknown send failure'
+            )}`
+          )
+        })
+    })
+    // wait for remote ready signal to arrive
+    yield* Deferred.await(state.isRemoteReady)
+  })
 
   return {
     addPeer: (id, peer) => {
@@ -218,9 +279,11 @@ export const createHandshakeManager = ({
         isActive: false,
         didLocalHandshakePass: false,
         didReceiveRemoteReady: false,
+        isRemoteReady: Deferred.makeUnsafe<true>(),
         handshakeTimer: null,
         pendingHandshakePayloads: [],
-        handshakeWaiters: []
+        handshakeWaiters: [],
+        handshakeFiber: null
       }
     },
 
@@ -231,6 +294,12 @@ export const createHandshakeManager = ({
         return
       }
 
+      Effect.all([
+        Deferred.interrupt(state.isRemoteReady),
+        state.handshakeFiber
+          ? Fiber.interrupt(state.handshakeFiber)
+          : Effect.void
+      ]).pipe(Effect.runSync)
       state.handshakeTimer = resetTimer(state.handshakeTimer)
       state.pendingHandshakePayloads.length = 0
       state.handshakeWaiters.splice(0).forEach(waiter => waiter.reject(error))
@@ -244,57 +313,31 @@ export const createHandshakeManager = ({
     },
 
     start: (id, peer) => {
-      const state = peerStates[id]
-
-      if (!state || state.peer !== peer) {
+      const handshake = makePeerHandshakeEffect(id, peer)
+      if (!handshake) {
         return
       }
-
-      state.handshakeTimer = setTimeout(
-        () =>
-          failPeerHandshake(
-            id,
-            peer,
-            mkErr(`handshake timed out after ${handshakeTimeoutMs}ms`)
-          ),
-        handshakeTimeoutMs
+      peerStates[id]!.handshakeFiber = handshake.pipe(
+        Effect.timeout(handshakeTimeoutMs),
+        Effect.tapError(err =>
+          Match.value(err).pipe(
+            Match.tagsExhaustive({
+              TimeoutError: _ =>
+                Effect.sync(() => {
+                  failPeerHandshake(
+                    id,
+                    peer,
+                    mkErr(`handshake timed out after ${handshakeTimeoutMs}ms`)
+                  )
+                }),
+              HandshakeFailed: err =>
+                Effect.sync(() => failPeerHandshake(id, peer, err.cause))
+            })
+          )
+        ),
+        Effect.tap(() => Effect.sync(() => maybeActivatePeer(id, peer))),
+        Effect.runFork
       )
-
-      const sendHandshake: HandshakeSender = async (data, metadata) => {
-        await sendHandshakeData(data, id, metadata)
-      }
-
-      const receiveHandshake: HandshakeReceiver = () =>
-        new Promise<HandshakePayload>((resolve, reject) => {
-          const current = peerStates[id]
-
-          if (!current || current.peer !== peer) {
-            reject(mkErr('peer disconnected during handshake'))
-            return
-          }
-
-          const payload = current.pendingHandshakePayloads.shift()
-
-          if (payload) {
-            resolve(payload)
-            return
-          }
-
-          current.handshakeWaiters.push({
-            resolve,
-            reject: error => reject(error)
-          })
-        })
-
-      const isInitiator = selfId < id
-
-      void Promise.resolve(
-        onPeerHandshake?.(id, sendHandshake, receiveHandshake, isInitiator)
-      )
-        .then(() => markLocalHandshakePassed(id, peer))
-        .catch(err =>
-          failPeerHandshake(id, peer, toError(err, 'handshake failed'))
-        )
     },
 
     receiveHandshakeData: (data, id, metadata) => {
@@ -324,6 +367,7 @@ export const createHandshakeManager = ({
       }
 
       state.didReceiveRemoteReady = true
+      Deferred.doneUnsafe(state.isRemoteReady, Effect.succeed(true))
       maybeActivatePeer(id)
     }
   }
