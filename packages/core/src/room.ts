@@ -9,7 +9,7 @@ import {
   toError
 } from './utils'
 import {createActionManager} from './actions'
-import {createHandshakeManager} from './handshake'
+import {HandshakeManager} from './handshake'
 import {createMediaManager, type InternalMediaMeta} from './media'
 import type {
   AddMediaOptions,
@@ -20,7 +20,10 @@ import type {
   SharedMediaPeer,
   TargetPeers
 } from './types'
-import {Effect, flow} from 'effect'
+import {Context, Effect, Exit, flow, pipe, Scope, Stream} from 'effect'
+import {ActionWireManager} from './action-wire'
+import {RoomPeerManager} from './room-peer-manager'
+import {makeRoomPeer, RoomPeerExitValue, RoomPeerEvent} from './room-peer'
 
 const unloadEvent = 'beforeunload'
 const defaultHandshakeTimeoutMs = 10_000
@@ -69,7 +72,7 @@ const make = Effect.fnUntraced(function* (
     isPassive = false
   }: RoomOptions = {}
 ) {
-  yield* Effect.void
+  const roomScope = yield* Scope.make()
   const peerMap: Record<string, PeerHandle> = {}
   const activePeerMap: Record<string, PeerHandle> = {}
   const pendingPongs: Record<string, PendingPongWaiter[] | undefined> = {}
@@ -78,7 +81,6 @@ const make = Effect.fnUntraced(function* (
     onPeerLeave: null as ((peerId: string) => void) | null
   }
   let unregisterBeforeUnloadCleanup: () => void = noOp
-  let handshakeManager: ReturnType<typeof createHandshakeManager> | null = null
 
   const iterate = (
     targets: TargetPeers,
@@ -109,63 +111,101 @@ const make = Effect.fnUntraced(function* (
       (peerMap[id] as SharedMediaPeer | undefined) ?? null
   })
 
+  const RoomScopeCtx = Context.make(Scope.Scope, roomScope)
+
+  const peerManager = yield* RoomPeerManager.make().pipe(
+    Effect.provideContext(RoomScopeCtx)
+  )
+  const PeerManagerCtx = Context.add(RoomScopeCtx, RoomPeerManager, peerManager)
+
   const actionManager = createActionManager({
     getPeer: (id, includePending) =>
       (includePending ? peerMap : activePeerMap)[id],
     getPeerIds: includePending =>
       keys(includePending ? peerMap : activePeerMap),
-    canReceiveFromPeer: (id, receiveWhilePending) =>
-      Boolean(handshakeManager?.canReceiveFromPeer(id, receiveWhilePending))
+    canReceiveFromPeer: Effect.fn(function* (id, receiveWhilePending) {
+      const peer = yield* peerManager.get(id)
+      if (!peer) {
+        return false
+      }
+      return receiveWhilePending ? true : peer._tag === 'Active'
+    }, Effect.runSync)
   })
+
+  const wireManager = yield* ActionWireManager.make({
+    onRegisteredPeerData: (...args) =>
+      Effect.sync(() => actionManager.handleData(...args))
+  }).pipe(Effect.provideContext(PeerManagerCtx))
+
+  const ActionManagerCtx = Context.add(
+    PeerManagerCtx,
+    ActionWireManager,
+    wireManager
+  )
+
+  const handshakeManager = yield* HandshakeManager.make({
+    onPeerHandshake
+  }).pipe(Effect.provideContext(ActionManagerCtx))
+
+  const RoomPeerContext = Context.add(
+    ActionManagerCtx,
+    HandshakeManager,
+    handshakeManager
+  )
+
   const makeActionInternal = actionManager.makeInternalAction
-  const handleData = actionManager.handleData
-  const makeAction = actionManager.makeAction
 
-  const clearPeerState = (
-    id: string,
-    reason: Error = mkErr('peer disconnected')
-  ): void => {
-    const err = toError(reason, 'peer disconnected')
+  // Track room peer connectivity events
+  yield* Effect.forkIn(roomScope)(
+    pipe(
+      peerManager.events.stream,
+      Stream.tap(
+        RoomPeerEvent.$match({
+          PeerDetected: () => Effect.void,
+          PeerActivated: ({peerId}) =>
+            Effect.gen(function* () {
+              const peer = yield* peerManager.get(peerId)
+              activePeerMap[peerId] = peer!.handle
+              listeners.onPeerJoin?.(peerId)
+            }),
+          PeerClosed: ({reason, peerId, wasActive}) =>
+            Effect.sync(() => {
+              delete activePeerMap[peerId]
+              actionManager.clearPeer(
+                peerId,
+                mkErr('peer disconnected: ' + reason)
+              )
+              pendingPongs[peerId]
+                ?.splice(0)
+                .forEach(waiter => waiter.reject(mkErr('peer disconnected')))
+              delete pendingPongs[peerId]
+              mediaManager.clearPeer(peerId)
 
-    handshakeManager?.clearPeer(id, err)
-    delete peerMap[id]
-    delete activePeerMap[id]
-    actionManager.clearPeer(id, err)
-    pendingPongs[id]?.splice(0).forEach(waiter => waiter.reject(err))
-    delete pendingPongs[id]
-    mediaManager.clearPeer(id)
-  }
-
-  const exitPeer = (id: string, peer?: PeerHandle, reason?: Error): void => {
-    const current = peerMap[id]
-
-    if (!current) {
-      return
-    }
-
-    if (peer && current !== peer) {
-      return
-    }
-
-    const wasActive = Boolean(activePeerMap[id])
-    clearPeerState(id, reason)
-    current.destroy()
-
-    if (wasActive) {
-      listeners.onPeerLeave?.(id)
-    }
-
-    onPeerLeave(id)
-  }
+              // keeping announce on HandshakeFailed to match original source behavior
+              const announceLeave =
+                reason === 'PeerDisconnected' ||
+                reason === 'PeerLeftRoom' ||
+                reason === 'HandshakeFailed'
+              if (announceLeave) {
+                onPeerLeave(peerId)
+                if (wasActive) {
+                  listeners.onPeerLeave?.(peerId)
+                }
+              }
+            })
+        })
+      ),
+      Stream.runDrain
+    )
+  )
 
   const leave = async (): Promise<void> => {
     await leaveAction.send('')
     await new Promise<void>(res => setTimeout(res, 99))
-
-    entries(peerMap).forEach(([id, peer]) => {
-      peer.destroy()
-      clearPeerState(id, mkErr('room left'))
-    })
+    Scope.close(
+      roomScope,
+      Exit.succeed(RoomPeerExitValue.RoomLeft({message: 'room left'}))
+    ).pipe(Effect.runSync)
 
     unregisterBeforeUnloadCleanup()
     onSelfLeave()
@@ -184,28 +224,6 @@ const make = Effect.fnUntraced(function* (
     sendToPending: true,
     receiveWhilePending: true
   })
-  const handshakeDataAction = makeActionInternal<DataPayload>(
-    internalNs('hsdata'),
-    {sendToPending: true, receiveWhilePending: true}
-  )
-  const handshakeReadyAction = makeActionInternal<string>(
-    internalNs('hsready'),
-    {sendToPending: true, receiveWhilePending: true}
-  )
-
-  handshakeManager = createHandshakeManager({
-    ...(onPeerHandshake === undefined ? {} : {onPeerHandshake}),
-    ...(onHandshakeError === undefined ? {} : {onHandshakeError}),
-    handshakeTimeoutMs,
-    sendHandshakeData: handshakeDataAction.send,
-    sendHandshakeReady: handshakeReadyAction.send,
-    onActivate: (id, peer) => {
-      activePeerMap[id] = peer
-      listeners.onPeerJoin?.(id)
-    },
-    onFailure: (id, peer, reason) => exitPeer(id, peer, reason)
-  })
-
   pingAction.onMessage((_, id) => pongAction.send('', id))
 
   pongAction.onMessage((_, id) => {
@@ -236,53 +254,51 @@ const make = Effect.fnUntraced(function* (
   )
 
   leaveAction.onMessage((_, id) =>
-    exitPeer(id, undefined, mkErr('peer left room'))
+    pipe(
+      peerManager.get(id),
+      Effect.andThen(exists =>
+        exists
+          ? exists.scope.exit('PeerLeftRoom', {
+              message: 'peer left room',
+              peer: exists.handle,
+              peerId: exists.peerId
+            })
+          : Effect.void
+      ),
+      Effect.runSync
+    )
   )
 
-  handshakeDataAction.onMessage((data, id, metadata) =>
-    handshakeManager?.receiveHandshakeData(data, id, metadata)
-  )
-
-  handshakeReadyAction.onMessage((_, id) =>
-    handshakeManager?.receiveHandshakeReady(id)
-  )
-
-  onPeer((peer, id) => {
-    const existingPeer = peerMap[id]
-
-    if (existingPeer) {
-      if (existingPeer === peer) {
-        return
-      }
-
-      existingPeer.destroy()
-      clearPeerState(id, mkErr('peer replaced'))
-    }
-
-    peerMap[id] = peer
-    handshakeManager?.addPeer(id, peer)
-
-    peer.setHandlers({
-      data: d => handleData(id, d),
-      stream: stream => mediaManager.receiveRemoteStream(id, stream),
-      track: (track, stream) =>
-        mediaManager.receiveRemoteTrack(id, track, stream),
-      signal: sdp => {
-        if (!activePeerMap[id]) {
+  onPeer(
+    flow(
+      Effect.fnUntraced(function* (peer: PeerHandle, id: string) {
+        const created = yield* makeRoomPeer({
+          peerId: id,
+          handle: peer,
+          handshakeTimeoutMs,
+          onHandshakeError
+        })
+        if (!created) {
           return
         }
+        peerMap[id] = peer
 
-        void signalAction.send(sdp as unknown as DataPayload, id)
-      },
-      close: () => exitPeer(id, peer, mkErr('peer disconnected')),
-      error: (err: Error) => {
-        console.error(`${libName} peer error:`, err)
-        exitPeer(id, peer, err)
-      }
-    })
+        peer.setHandlers({
+          stream: stream => mediaManager.receiveRemoteStream(id, stream),
+          track: (track, stream) =>
+            mediaManager.receiveRemoteTrack(id, track, stream),
+          signal: sdp => {
+            if (!activePeerMap[id]) {
+              return
+            }
 
-    handshakeManager?.start(id, peer)
-  })
+            void signalAction.send(sdp as unknown as DataPayload, id)
+          }
+        })
+      }, Effect.provideContext(RoomPeerContext)),
+      Effect.runSync
+    )
+  )
 
   if (isBrowser) {
     unregisterBeforeUnloadCleanup = registerBeforeUnloadCleanup(() =>
@@ -291,7 +307,7 @@ const make = Effect.fnUntraced(function* (
   }
 
   return {
-    makeAction,
+    makeAction: actionManager.makeAction,
 
     leave,
 

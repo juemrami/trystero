@@ -11,6 +11,22 @@ import {
   toJson
 } from './utils'
 import type {DataPayload, JsonValue, PeerHandle, TargetPeers} from './types'
+import {
+  Context,
+  Data,
+  Effect,
+  Fiber,
+  flow,
+  pipe,
+  PubSub,
+  Ref,
+  Result,
+  Scope,
+  Stream,
+  Types
+} from 'effect'
+import type {RoomPeerScope, RoomPeerState} from './room-peer'
+import {RoomPeerManager} from './room-peer-manager'
 
 const TypedArray = Object.getPrototypeOf(Uint8Array)
 const typeByteLimit = 32
@@ -27,6 +43,8 @@ const buffLowEvent = 'bufferedamountlow'
 const channelCloseEvent = 'close'
 const channelErrorEvent = 'error'
 const backpressureWaitTimeoutMs = 10_000
+
+export const internalActionNs = (ns: string): string => '@_' + ns
 
 export type ActionOptions = {
   sendToPending: boolean
@@ -148,6 +166,632 @@ const waitForBufferedAmountLow = (
   })
 }
 
+type ChannelBufferFailure = Data.TaggedEnum<{
+  ChannelClosed: {}
+  ChannelError: {error: RTCErrorEvent}
+  TimeoutError: {}
+  ChannelNotReady: {state: RTCDataChannelState}
+}>
+
+// waits for the channel buffered data size to fall below `channel.bufferedAmountLowThreshold`
+const waitForChannelBufferSpace = Effect.fnUntraced(function* (
+  channel,
+  timeoutMs = backpressureWaitTimeoutMs
+) {
+  const {ChannelClosed, ChannelError, TimeoutError, ChannelNotReady} =
+    Data.taggedEnum<ChannelBufferFailure>()
+  if (channel.readyState !== 'open') {
+    return Result.fail(ChannelNotReady({state: channel.readyState}))
+  }
+  if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) {
+    return Result.void
+  }
+  const bufferLowEvents = Stream.fromEventListener(channel, buffLowEvent)
+  const closeEvents = Stream.fromEventListener(channel, channelCloseEvent)
+  const errorEvents = Stream.fromEventListener(channel, channelErrorEvent)
+  const result = Stream.mergeAll<
+    Result.Result<void, ChannelBufferFailure>,
+    never,
+    never
+  >(
+    [
+      bufferLowEvents.pipe(Stream.map(_ => Result.void)),
+      closeEvents.pipe(Stream.map(_ => Result.fail(ChannelClosed()))),
+      errorEvents.pipe(
+        Stream.map(error =>
+          Result.fail(ChannelError({error: error as RTCErrorEvent}))
+        )
+      )
+    ],
+    {concurrency: 3}
+  ).pipe(
+    Stream.take(1),
+    Stream.runCollect,
+    Effect.map(res => res[0]!),
+    Effect.timeout(timeoutMs),
+    Effect.catchTag('TimeoutError', _ =>
+      Effect.succeed(Result.fail(TimeoutError()))
+    )
+  )
+  return yield* result
+})
+
+export type ActionWireEvent = Data.TaggedEnum<{
+  ReceiveComplete: {
+    payload: DataPayload
+    peerId: string
+    isBinary?: boolean | undefined
+    metadata?: JsonValue | undefined
+    action: string
+  }
+  ReceiveInProgress: {
+    percent: number
+    peerId: string
+    metadata?: JsonValue | undefined
+    isBinary?: boolean | undefined
+    action: string
+  }
+  SendInProgress: {
+    percent: number
+    peerId: string
+    metadata?: JsonValue | undefined
+    action: string
+  }
+  SendComplete: {
+    peerId: string
+    metadata?: JsonValue | undefined
+    action: string
+  }
+  ReceiveError: {
+    error: ActionReceiveError
+  }
+}>
+export const ActionWireEvent = Data.taggedEnum<ActionWireEvent>()
+
+export type MakeActionFailure = Data.TaggedEnum<{
+  RedefinitionAttempted: {}
+  EmptyTypeName: {}
+  TypeNameTooLong: {byteLength: number; byteLimit: number}
+}>
+export const MakeActionFailure =Data.taggedEnum<MakeActionFailure>()
+const {RedefinitionAttempted, EmptyTypeName, TypeNameTooLong} = MakeActionFailure
+
+export class MakeActionError extends Data.TaggedError('MakeActionError')<{
+  readonly reason: MakeActionFailure
+  readonly cause: unknown
+}> {}
+export class ActionSendError extends Data.TaggedError('ActionSendError')<{
+  readonly reason:
+    | 'PeerNotFound'
+    | 'PeerChanged'
+    | 'PeerNotReady'
+    | 'InvalidActionData'
+    | Types.Tags<ChannelBufferFailure>
+  readonly cause: Error | RTCErrorEvent
+}> {}
+export class ActionReceiveError extends Data.TaggedError('ActionReceiveError')<{
+  readonly reason:
+    | 'PeerNotFound'
+    | 'PeerChanged'
+    | 'PeerNotReady'
+    | 'PeerDisconnected'
+    | 'InvalidActionType'
+  readonly cause: Error | RTCErrorEvent
+}> {}
+
+export type ActionWire<T extends DataPayload = DataPayload> = {
+  /** call will synchronously error if invalid data or target peers.
+   * Transmission errors will be observable in their respective fibers
+   * */
+  send: (
+    data: T,
+    targetPeers: string[],
+    metadata?: JsonValue
+  ) => Effect.Effect<Array<Fiber.Fiber<true, ActionSendError>>, ActionSendError>
+  events: Stream.Stream<ActionWireEvent>
+}
+
+export class ActionWireManager extends Context.Service<ActionWireManager>()(
+  'ActionWireManager',
+  {
+    make: Effect.fnUntraced(function* (args?: {
+      /** todo: remove. for legacy actionManager */
+      onRegisteredPeerData?: (
+        peerId: string,
+        data: ArrayBuffer
+      ) => Effect.Effect<any>
+    }) {
+      const createdActionsCache: Map<
+        string,
+        {
+          action: ActionWire
+          receiver: (
+            peerId: string,
+            data: ArrayBuffer
+          ) => Effect.Effect<any, ActionReceiveError>
+          options?: Partial<ActionOptions>
+        }
+      > = new Map()
+
+      const peerManager = yield* RoomPeerManager
+      const registeredPeers = new Map<string, typeof RoomPeerScope.Service>()
+      const registeredPeerData = yield* PubSub.unbounded<{
+        peerId: string
+        peerScope: typeof RoomPeerScope.Service
+        data: ArrayBuffer
+      }>()
+      const pendingTransmissions: Record<
+        string,
+        Record<string, Record<number, PendingTransmission>>
+      > = {}
+
+      const registerPeer: (
+        peer: RoomPeerState
+      ) => Effect.Effect<Result.Result<void, 'OpenScopeExists'>> =
+        Effect.fnUntraced(function* (peer) {
+          const existingScope = registeredPeers.get(peer.peerId)
+          if (existingScope) {
+            if (existingScope.internal.state._tag !== 'Closed') {
+              return Result.fail('OpenScopeExists')
+            }
+          }
+          registeredPeers.set(peer.peerId, peer.scope)
+          yield* peer.scope.addFinalizerExit(_ =>
+            Effect.sync(() => {
+              registeredPeers.delete(peer.peerId)
+              delete pendingTransmissions[peer.peerId]
+            })
+          )
+          yield* Effect.forkIn(peer.scope.internal)(
+            pipe(
+              peer.dataStream,
+              Stream.tap(data =>
+                PubSub.publish(registeredPeerData, {
+                  peerId: peer.peerId,
+                  peerScope: peer.scope,
+                  data
+                })
+              ),
+              Stream.runDrain
+            )
+          )
+          return Result.void
+        })
+
+      yield* Effect.addFinalizer(() => PubSub.shutdown(registeredPeerData))
+
+      const makeActionRtcDataChannelSender: (args: {
+        sendToPending?: boolean
+        type: string
+        typeBytesPadded: Uint8Array
+        eventHub: PubSub.PubSub<ActionWireEvent>
+      }) => ActionWire['send'] = args => {
+        let nonce = 0
+        return Effect.fnUntraced(function* (data, targets, meta) {
+          // throwIfAborted(signal)
+          const dataType = typeof data
+
+          if (dataType === 'undefined') {
+            return yield* new ActionSendError({
+              reason: 'InvalidActionData',
+              cause: mkErr('action data cannot be undefined')
+            })
+          }
+          const managedPeers = yield* peerManager.getAll()
+          const targetPeers = managedPeers.filter(
+            s =>
+              (args?.sendToPending ? true : s._tag === 'Active') &&
+              targets.includes(s.peerId)
+          )
+          if (targetPeers.length === 0) {
+            return yield* new ActionSendError({
+              reason: 'PeerNotFound',
+              cause: mkErr(
+                `no valid target peers found for action "${args.type}". sendToPending=${Boolean(args?.sendToPending)}`
+              )
+            })
+          }
+          const isJson = dataType !== 'string'
+          const isBlob = data instanceof Blob
+          const isBinary =
+            isBlob || data instanceof ArrayBuffer || data instanceof TypedArray
+          const hasMeta = meta !== undefined
+
+          const buffer = isBinary
+            ? toByteArray(
+                isBlob
+                  ? yield* Effect.promise(() => data.arrayBuffer())
+                  : (data as ArrayBuffer | ArrayBufferView)
+              )
+            : encodeBytes(isJson ? toJson(data) : (data as string))
+
+          const metaEncoded = hasMeta ? encodeBytes(toJson(meta)) : null
+
+          const chunkTotal =
+            Math.ceil(buffer.byteLength / chunkSize) + (hasMeta ? 1 : 0) || 1
+
+          const chunks = alloc(chunkTotal, (_, i) => {
+            const isLast = i === chunkTotal - 1
+            const isMeta = Boolean(hasMeta && i === 0)
+            const chunk = new Uint8Array(
+              payloadIndex +
+                (isMeta
+                  ? (metaEncoded?.byteLength ?? 0)
+                  : isLast
+                    ? buffer.byteLength -
+                      chunkSize * (chunkTotal - (hasMeta ? 2 : 1))
+                    : chunkSize)
+            )
+
+            chunk.set(args.typeBytesPadded)
+            chunk.set([nonce >> 8, nonce & oneByteMax], nonceIndex)
+            chunk.set(
+              [
+                Number(isLast) |
+                  (Number(isMeta) << 1) |
+                  (Number(isBinary) << 2) |
+                  (Number(isJson) << 3)
+              ],
+              tagIndex
+            )
+            chunk.set(
+              [Math.round(((i + 1) / chunkTotal) * oneByteMax)],
+              progressIndex
+            )
+            chunk.set(
+              hasMeta
+                ? isMeta
+                  ? (metaEncoded ?? new Uint8Array())
+                  : buffer.subarray((i - 1) * chunkSize, i * chunkSize)
+                : buffer.subarray(i * chunkSize, (i + 1) * chunkSize),
+              payloadIndex
+            )
+
+            return chunk
+          })
+
+          nonce = (nonce + 1) & twoByteMax
+
+          const transmit = Effect.fnUntraced(function* (target: string) {
+            const peerRef = peerManager.getRef(target)
+            if (!peerRef) {
+              return yield* new ActionSendError({
+                reason: 'PeerNotFound',
+                cause: mkErr(`no peer with id ${target} found`)
+              })
+            }
+            const peer = yield* Ref.get(peerRef)
+            if (!args?.sendToPending && peer._tag !== 'Active') {
+              return yield* new ActionSendError({
+                reason: 'PeerNotReady',
+                cause: mkErr(`peer with id ${target} pending handshake`)
+              })
+            }
+            const {channel} = peer.handle
+            let chunkN = 0
+
+            while (chunkN < chunkTotal) {
+              // throwIfAborted(signal)
+              const chunk = chunks[chunkN]
+
+              if (!chunk) {
+                break
+              }
+
+              if (
+                channel &&
+                channel.bufferedAmount > channel.bufferedAmountLowThreshold
+              ) {
+                const result = yield* waitForChannelBufferSpace(channel)
+
+                // throwIfAborted(signal)
+
+                if (Result.isFailure(result)) {
+                  return yield* new ActionSendError({
+                    reason: result.failure._tag,
+                    cause:
+                      result.failure._tag === 'ChannelError'
+                        ? result.failure.error
+                        : mkErr(`failed waiting for data channel buffer`)
+                  })
+                }
+              }
+
+              const currentPeer = yield* peerManager.get(target)
+
+              if (!currentPeer || currentPeer.handle !== peer.handle) {
+                return yield* new ActionSendError({
+                  reason: 'PeerChanged',
+                  cause: mkErr(
+                    `target peer handle changed during data transmission`
+                  )
+                })
+              }
+
+              peer.handle.sendData(chunk)
+              chunkN++
+              const progressByte = chunk[progressIndex] ?? oneByteMax
+
+              yield* PubSub.publish(
+                args.eventHub,
+                ActionWireEvent.SendInProgress({
+                  peerId: target,
+                  percent: progressByte / oneByteMax,
+                  metadata: meta,
+                  action: args.type
+                })
+              )
+            }
+            yield* PubSub.publish(
+              args.eventHub,
+              ActionWireEvent.SendComplete({
+                peerId: target,
+                metadata: meta,
+                action: args.type
+              })
+            )
+            return true as const
+          })
+          return yield* pipe(
+            targetPeers.map(({peerId, scope}) =>
+              pipe(transmit(peerId), Effect.forkIn(scope.internal))
+            ),
+            Effect.all
+          )
+        })
+      }
+      // create action specific receiver for incoming data from rtc peers
+      const makeActionRtcDataChannelReceiver: (config: {
+        type: string
+        eventHub: PubSub.PubSub<ActionWireEvent>
+      }) => (
+        peerId: string,
+        data: ArrayBuffer
+      ) => Effect.Effect<any, ActionReceiveError> = config =>
+        Effect.fnUntraced(function* (peerId: string, data: ArrayBuffer) {
+          const buffer = new Uint8Array(data)
+          const type = decodeBytes(
+            buffer.subarray(typeIndex, nonceIndex)
+          ).replaceAll('\x00', '')
+          const action = createdActionsCache.get(type)
+
+          if (!action) {
+            return yield* new ActionReceiveError({
+              reason: 'InvalidActionType',
+              cause: mkErr(
+                `received data for unregistered action of type="${type}"`
+              )
+            })
+          }
+
+          if (type !== config.type) {
+            return yield* new ActionReceiveError({
+              reason: 'InvalidActionType',
+              cause: mkErr(
+                `received data for action of type="${type}" in handler for type="${config.type}"`
+              )
+            })
+          }
+
+          const peer = yield* peerManager.get(peerId)
+          if (!peer) {
+            return yield* new ActionReceiveError({
+              reason: 'PeerNotFound',
+              cause: mkErr(`received data from unknown peer ${peerId}`)
+            })
+          }
+          if (
+            Boolean(action.options?.receiveWhilePending) === false &&
+            peer._tag !== 'Active'
+          ) {
+            return yield* new ActionReceiveError({
+              reason: 'PeerNotReady',
+              cause: mkErr(
+                `received data from peer ${peerId} who has not completed handshake yet`
+              )
+            })
+          }
+          yield* PubSub.publish(config.eventHub, {
+            _tag: 'ReceiveInProgress',
+            peerId,
+            percent: 0,
+            metadata: undefined,
+            action: type
+          })
+
+          const nonce =
+            ((buffer[nonceIndex] ?? 0) << 8) | (buffer[nonceIndex + 1] ?? 0)
+          const tag = buffer[tagIndex] ?? 0
+          const progress = buffer[progressIndex] ?? 0
+          const payload = buffer.subarray(payloadIndex)
+          const isLast = Boolean(tag & 1)
+          const isMeta = Boolean(tag & (1 << 1))
+          const isBinary = Boolean(tag & (1 << 2))
+          const isJson = Boolean(tag & (1 << 3))
+
+          pendingTransmissions[peerId] ??= {}
+          pendingTransmissions[peerId][type] ??= {}
+
+          const target = (pendingTransmissions[peerId][type][nonce] ??= {
+            chunks: []
+          })
+
+          if (isMeta) {
+            target.meta = fromJson<JsonValue>(decodeBytes(payload))
+          } else {
+            target.chunks.push(payload)
+          }
+          if (!isLast) {
+            return yield* PubSub.publish(
+              config.eventHub,
+              ActionWireEvent.ReceiveInProgress({
+                peerId,
+                percent: progress / oneByteMax,
+                metadata: target.meta,
+                action: type
+              })
+            )
+          }
+          const full = new Uint8Array(
+            target.chunks.reduce(
+              (a: number, c: Uint8Array) => a + c.byteLength,
+              0
+            )
+          )
+
+          target.chunks.reduce((a: number, c: Uint8Array) => {
+            full.set(c, a)
+            return a + c.byteLength
+          }, 0)
+
+          delete pendingTransmissions[peerId][type][nonce]
+
+          const payloadValue = isBinary
+            ? full
+            : isJson
+              ? fromJson<JsonValue>(decodeBytes(full))
+              : decodeBytes(full)
+
+          return yield* PubSub.publish(
+            config.eventHub,
+            ActionWireEvent.ReceiveComplete({
+              peerId,
+              isBinary,
+              metadata: target.meta,
+              action: type,
+              payload: payloadValue
+            })
+          )
+        })
+
+      // map incoming rtc peer data to the correct action receiver
+      yield* Effect.forkScoped(
+        pipe(
+          Stream.fromPubSub(registeredPeerData),
+          Stream.tap(({peerId, data}) =>
+            Effect.gen(function* () {
+              const buffer = new Uint8Array(data)
+
+              const incomingActionId = decodeBytes(
+                buffer.subarray(typeIndex, nonceIndex)
+              ).replaceAll('\x00', '')
+
+              const action = createdActionsCache.get(incomingActionId)
+
+              // If effect action handler not found, fall through to legacy handler
+              if (action) {
+                yield* action.receiver(peerId, data)
+              } else if (args?.onRegisteredPeerData) {
+                yield* args.onRegisteredPeerData!(peerId, data)
+              }
+            })
+          ),
+          Stream.runDrain
+        )
+      )
+
+      const makeActionWire: <T extends DataPayload = DataPayload>(
+        type: string,
+        options?: Partial<ActionOptions> | undefined
+      ) => Effect.Effect<ActionWire<T>, MakeActionError, Scope.Scope> =
+        Effect.fnUntraced(function* (type, options) {
+          if (type.length === 0) {
+            return yield* new MakeActionError({
+              reason: EmptyTypeName(),
+              // action type argument is required // old msg
+              cause: mkErr(`action type cannot be an empty string`)
+            })
+          }
+          const existing = createdActionsCache.get(type)
+          if (existing) {
+            const cachedOptions = existing.options
+            if (
+              Boolean(cachedOptions?.sendToPending) !==
+                Boolean(options?.sendToPending) ||
+              Boolean(cachedOptions?.receiveWhilePending) !==
+                Boolean(options?.receiveWhilePending)
+            ) {
+              return yield* new MakeActionError({
+                reason: RedefinitionAttempted(),
+                cause: mkErr(`action type "${type}" cannot be redefined`)
+              })
+            }
+            return existing.action
+          }
+
+          const typeBytes = encodeBytes(type)
+          if (typeBytes.byteLength > typeByteLimit) {
+            return yield* new MakeActionError({
+              reason: TypeNameTooLong({
+                byteLength: typeBytes.byteLength,
+                byteLimit: typeByteLimit
+              }),
+              cause: mkErr(
+                `action type string "${type}" (${typeBytes.byteLength}b) exceeds ` +
+                  `byte limit (${typeByteLimit}). Hint: choose a shorter name.`
+              )
+            })
+          }
+
+          const actionEventsHub = yield* PubSub.bounded<ActionWireEvent>({
+            capacity: 64
+          })
+
+          const normalizedOptions = {
+            sendToPending: Boolean(options?.sendToPending),
+            receiveWhilePending: Boolean(options?.receiveWhilePending)
+          }
+          const actionReceiver = flow(
+            makeActionRtcDataChannelReceiver({
+              type,
+              eventHub: actionEventsHub
+            }),
+            Effect.catch(error =>
+              PubSub.publish(
+                actionEventsHub,
+                ActionWireEvent.ReceiveError({error})
+              )
+            )
+          )
+          yield* Effect.addFinalizer(() =>
+            Effect.all([
+              PubSub.shutdown(actionEventsHub),
+              Effect.sync(() => createdActionsCache.delete(type))
+            ])
+          )
+
+          const actionSurface = {
+            send: makeActionRtcDataChannelSender({
+              type,
+              typeBytesPadded: pipe(new Uint8Array(typeByteLimit), buf => {
+                buf.set(typeBytes)
+                return buf
+              }),
+              eventHub: actionEventsHub,
+              sendToPending: normalizedOptions.sendToPending
+            }),
+            events: Stream.fromPubSub(actionEventsHub)
+          }
+          createdActionsCache.set(type, {
+            options: normalizedOptions,
+            action: actionSurface,
+            receiver: actionReceiver
+          })
+
+          return actionSurface
+        })
+      return {
+        makeActionWire,
+        registerPeer
+      }
+    })
+  }
+) {
+  static registerPeer = (
+    ...args: Parameters<(typeof this.Service)['registerPeer']>
+  ) => this.use(s => s.registerPeer(...args))
+}
+
 export const createActionWireManager = ({
   getPeer,
   getPeerIds,
@@ -168,7 +812,6 @@ export const createActionWireManager = ({
     Record<string, Record<number, PendingTransmission>>
   > = {}
   const pendingActionPayloads: Record<string, PendingActionPayload[]> = {}
-
   const iterate = (
     targets: TargetPeers,
     f: (id: string, peer: PeerHandle) => Promise<void> | void,
