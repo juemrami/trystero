@@ -171,46 +171,53 @@ type ChannelBufferFailure = Data.TaggedEnum<{
   ChannelError: {error: RTCErrorEvent}
   TimeoutError: {}
   ChannelNotReady: {state: RTCDataChannelState}
+  Aborted: {}
 }>
+const ChannelBufferFailure = Data.taggedEnum<ChannelBufferFailure>()
 
 // waits for the channel buffered data size to fall below `channel.bufferedAmountLowThreshold`
 const waitForChannelBufferSpace = Effect.fnUntraced(function* (
   channel,
   timeoutMs = backpressureWaitTimeoutMs
 ) {
-  const {ChannelClosed, ChannelError, TimeoutError, ChannelNotReady} =
-    Data.taggedEnum<ChannelBufferFailure>()
   if (channel.readyState !== 'open') {
-    return Result.fail(ChannelNotReady({state: channel.readyState}))
+    return Result.fail(
+      ChannelBufferFailure.ChannelNotReady({state: channel.readyState})
+    )
   }
   if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) {
     return Result.void
   }
-  const bufferLowEvents = Stream.fromEventListener(channel, buffLowEvent)
-  const closeEvents = Stream.fromEventListener(channel, channelCloseEvent)
-  const errorEvents = Stream.fromEventListener(channel, channelErrorEvent)
-  const result = Stream.mergeAll<
-    Result.Result<void, ChannelBufferFailure>,
-    never,
-    never
-  >(
-    [
-      bufferLowEvents.pipe(Stream.map(_ => Result.void)),
-      closeEvents.pipe(Stream.map(_ => Result.fail(ChannelClosed()))),
-      errorEvents.pipe(
-        Stream.map(error =>
-          Result.fail(ChannelError({error: error as RTCErrorEvent}))
-        )
-      )
-    ],
-    {concurrency: 3}
-  ).pipe(
-    Stream.take(1),
-    Stream.runCollect,
-    Effect.map(res => res[0]!),
+  type CallbackResult = Result.Result<void, ChannelBufferFailure>
+  const result = Effect.callback<CallbackResult>(res => {
+    const cleanup = () => {
+      channel.removeEventListener(buffLowEvent, onSuccess)
+      channel.removeEventListener(channelCloseEvent, onClose)
+      channel.removeEventListener(channelErrorEvent, onError)
+    }
+
+    const finish = (result: CallbackResult) => {
+      cleanup()
+      res(Effect.succeed(result))
+    }
+
+    const onSuccess = () => finish(Result.void)
+    const onClose = () =>
+      finish(Result.fail(ChannelBufferFailure.ChannelClosed()))
+    const onError = (error: RTCErrorEvent) =>
+      finish(Result.fail(ChannelBufferFailure.ChannelError({error})))
+
+    channel.addEventListener(buffLowEvent, onSuccess)
+    channel.addEventListener(channelCloseEvent, onClose)
+    channel.addEventListener(channelErrorEvent, onError)
+
+    return Effect.sync(() =>
+      finish(Result.fail(ChannelBufferFailure.Aborted()))
+    )
+  }).pipe(
     Effect.timeout(timeoutMs),
     Effect.catchTag('TimeoutError', _ =>
-      Effect.succeed(Result.fail(TimeoutError()))
+      Effect.succeed(Result.fail(ChannelBufferFailure.TimeoutError()))
     )
   )
   return yield* result
@@ -253,8 +260,9 @@ export type MakeActionFailure = Data.TaggedEnum<{
   EmptyTypeName: {}
   TypeNameTooLong: {byteLength: number; byteLimit: number}
 }>
-export const MakeActionFailure =Data.taggedEnum<MakeActionFailure>()
-const {RedefinitionAttempted, EmptyTypeName, TypeNameTooLong} = MakeActionFailure
+export const MakeActionFailure = Data.taggedEnum<MakeActionFailure>()
+const {RedefinitionAttempted, EmptyTypeName, TypeNameTooLong} =
+  MakeActionFailure
 
 export class MakeActionError extends Data.TaggedError('MakeActionError')<{
   readonly reason: MakeActionFailure
@@ -591,13 +599,6 @@ export class ActionWireManager extends Context.Service<ActionWireManager>()(
               )
             })
           }
-          yield* PubSub.publish(config.eventHub, {
-            _tag: 'ReceiveInProgress',
-            peerId,
-            percent: 0,
-            metadata: undefined,
-            action: type
-          })
 
           const nonce =
             ((buffer[nonceIndex] ?? 0) << 8) | (buffer[nonceIndex + 1] ?? 0)

@@ -5,7 +5,6 @@ import {
   keys,
   libName,
   mkErr,
-  noOp,
   toError
 } from './utils'
 import {createActionManager} from './actions'
@@ -18,36 +17,33 @@ import type {
   PeerHandshake,
   Room,
   SharedMediaPeer,
+  Signal,
   TargetPeers
 } from './types'
-import {Context, Effect, Exit, flow, pipe, Scope, Stream} from 'effect'
-import {ActionWireManager} from './action-wire'
+import {
+  Array,
+  Context,
+  Effect,
+  Exit,
+  Fiber,
+  flow,
+  Function,
+  identity,
+  pipe,
+  Scope,
+  Stream
+} from 'effect'
+import {
+  ActionWireEvent,
+  ActionWireManager,
+  type ActionWire
+} from './action-wire'
 import {RoomPeerManager} from './room-peer-manager'
 import {makeRoomPeer, RoomPeerExitValue, RoomPeerEvent} from './room-peer'
 
 const unloadEvent = 'beforeunload'
 const defaultHandshakeTimeoutMs = 10_000
 const internalNs = (ns: string): string => '@_' + ns
-const beforeUnloadRoomCleanups = new Set<() => void>()
-
-const cleanupActiveRoomsOnBeforeUnload = (): void =>
-  beforeUnloadRoomCleanups.forEach(cleanup => cleanup())
-
-const registerBeforeUnloadCleanup = (cleanup: () => void): (() => void) => {
-  beforeUnloadRoomCleanups.add(cleanup)
-
-  if (beforeUnloadRoomCleanups.size === 1) {
-    addEventListener(unloadEvent, cleanupActiveRoomsOnBeforeUnload)
-  }
-
-  return (): void => {
-    beforeUnloadRoomCleanups.delete(cleanup)
-
-    if (!beforeUnloadRoomCleanups.size) {
-      removeEventListener(unloadEvent, cleanupActiveRoomsOnBeforeUnload)
-    }
-  }
-}
 
 type RoomOptions = {
   onPeerHandshake?: PeerHandshake
@@ -80,7 +76,6 @@ const make = Effect.fnUntraced(function* (
     onPeerJoin: null as ((peerId: string) => void) | null,
     onPeerLeave: null as ((peerId: string) => void) | null
   }
-  let unregisterBeforeUnloadCleanup: () => void = noOp
 
   const iterate = (
     targets: TargetPeers,
@@ -153,7 +148,38 @@ const make = Effect.fnUntraced(function* (
     handshakeManager
   )
 
-  const makeActionInternal = actionManager.makeInternalAction
+  const makeActionInternal = flow(
+    wireManager.makeActionWire,
+    Scope.provide(roomScope)
+  )
+
+  const normalizeTargetPeers = Effect.fn(function* (
+    target: TargetPeers,
+    includePending?: boolean
+  ) {
+    return yield* target
+      ? Effect.succeed(Array.isArray(target) ? target : [target])
+      : Effect.map(
+          peerManager.getAll({
+            activeOnly: !includePending
+          }),
+          found => found.map(p => p.peerId)
+        )
+  })
+
+  /** awaits action's ReceiveComplete event and runs the given callback */
+  const onWireReceivedListener = <A, E, T extends DataPayload>(args: {
+    wire: ActionWire<T>
+    listener: (payload: T, peerId: string) => Effect.Effect<A, E>
+    take?: number /** ends stream listener once N events have been emitted */
+  }) =>
+    Stream.runDrain(
+      args.wire.events.pipe(
+        Stream.filter(ActionWireEvent.$is('ReceiveComplete')),
+        Stream.tap(({payload, peerId}) => args.listener(payload as T, peerId)),
+        args.take ? Stream.take(args.take) : identity
+      )
+    )
 
   // Track room peer connectivity events
   yield* Effect.forkIn(roomScope)(
@@ -199,75 +225,80 @@ const make = Effect.fnUntraced(function* (
     )
   )
 
-  const leave = async (): Promise<void> => {
-    await leaveAction.send('')
-    await new Promise<void>(res => setTimeout(res, 99))
-    Scope.close(
-      roomScope,
-      Exit.succeed(RoomPeerExitValue.RoomLeft({message: 'room left'}))
-    ).pipe(Effect.runSync)
-
-    unregisterBeforeUnloadCleanup()
-    onSelfLeave()
-  }
-
-  const pingAction = makeActionInternal<string>(internalNs('ping'))
-  const pongAction = makeActionInternal<string>(internalNs('pong'))
-  const signalAction = makeActionInternal(internalNs('signal'))
-  const streamMetaAction = makeActionInternal<InternalMediaMeta>(
+  const pingAction = yield* makeActionInternal<string>(internalNs('ping'))
+  const pongAction = yield* makeActionInternal<string>(internalNs('pong'))
+  const signalAction = yield* makeActionInternal<Signal>(internalNs('signal'))
+  const streamMetaAction = yield* makeActionInternal<InternalMediaMeta>(
     internalNs('stream')
   )
-  const trackMetaAction = makeActionInternal<InternalMediaMeta>(
+  const trackMetaAction = yield* makeActionInternal<InternalMediaMeta>(
     internalNs('track')
   )
-  const leaveAction = makeActionInternal<string>(internalNs('leave'), {
+  const leaveAction = yield* makeActionInternal<string>(internalNs('leave'), {
     sendToPending: true,
     receiveWhilePending: true
   })
-  pingAction.onMessage((_, id) => pongAction.send('', id))
 
-  pongAction.onMessage((_, id) => {
-    const queue = pendingPongs[id]
-    const waiter = queue?.shift()
+  const replyWithPongFiber = yield* onWireReceivedListener({
+    wire: pingAction,
+    listener: (_, id) => pongAction.send('', [id])
+  }).pipe(Effect.forkIn(roomScope))
 
-    waiter?.resolve()
+  yield* onWireReceivedListener({
+    wire: pongAction,
+    listener: (_, id) =>
+      Effect.sync(() => {
+        const queue = pendingPongs[id]
+        const waiter = queue?.shift()
 
-    if (queue && !queue.length) {
-      delete pendingPongs[id]
-    }
-  })
+        waiter?.resolve()
 
-  signalAction.onMessage((sdp, id) => {
-    if (!activePeerMap[id]) {
-      return
-    }
+        if (queue && !queue.length) {
+          delete pendingPongs[id]
+        }
+      })
+  }).pipe(Effect.forkIn(roomScope))
 
-    void peerMap[id]?.signal(sdp as never)
-  })
+  yield* onWireReceivedListener({
+    wire: signalAction,
+    listener: (sdp, id) =>
+      Effect.sync(() => {
+        if (!activePeerMap[id]) {
+          return
+        }
 
-  streamMetaAction.onMessage((meta, id) =>
-    mediaManager.receiveStreamMeta(meta, id)
-  )
+        void peerMap[id]?.signal(sdp as never)
+      })
+  }).pipe(Effect.forkIn(roomScope))
 
-  trackMetaAction.onMessage((meta, id) =>
-    mediaManager.receiveTrackMeta(meta, id)
-  )
+  yield* onWireReceivedListener({
+    wire: streamMetaAction,
+    listener: (meta, id) =>
+      Effect.sync(() => mediaManager.receiveStreamMeta(meta, id))
+  }).pipe(Effect.forkIn(roomScope))
 
-  leaveAction.onMessage((_, id) =>
-    pipe(
-      peerManager.get(id),
-      Effect.andThen(exists =>
-        exists
-          ? exists.scope.exit('PeerLeftRoom', {
-              message: 'peer left room',
-              peer: exists.handle,
-              peerId: exists.peerId
-            })
-          : Effect.void
-      ),
-      Effect.runSync
-    )
-  )
+  yield* onWireReceivedListener({
+    wire: trackMetaAction,
+    listener: (meta, id) =>
+      Effect.sync(() => mediaManager.receiveTrackMeta(meta, id))
+  }).pipe(Effect.forkIn(roomScope))
+
+  yield* onWireReceivedListener({
+    wire: leaveAction,
+    listener: (_, id) =>
+      pipe(
+        peerManager.get(id),
+        Effect.andThen(exists =>
+          exists
+            ? exists.scope.exit('PeerLeftRoom', {
+                message: 'peer left room',
+                peer: exists.handle,
+                peerId: exists.peerId
+              })
+            : Effect.void
+        )
+      )
+  }).pipe(Effect.forkIn(roomScope))
 
   onPeer(
     flow(
@@ -292,7 +323,7 @@ const make = Effect.fnUntraced(function* (
               return
             }
 
-            void signalAction.send(sdp as unknown as DataPayload, id)
+            signalAction.send(sdp, [id]).pipe(Effect.runPromise)
           }
         })
       }, Effect.provideContext(RoomPeerContext)),
@@ -300,16 +331,56 @@ const make = Effect.fnUntraced(function* (
     )
   )
 
+  const mediaManagerActionAdapter =
+    <T extends DataPayload>(action: ActionWire<T>) =>
+    (data: T, target: TargetPeers) =>
+      Effect.gen(function* () {
+        const targets = yield* normalizeTargetPeers(target)
+        const fibers = yield* action.send(data, targets)
+        return fibers.map(Function.constVoid)
+      }).pipe(Effect.runPromise)
+
+  const sendTrackMeta = mediaManagerActionAdapter(trackMetaAction)
+  const sendStreamMeta = mediaManagerActionAdapter(streamMetaAction)
+
+  const leaveRoom = Effect.gen(function* () {
+    const peerIds = (yield* peerManager.getAll()).map(p => p.peerId)
+    const sendLeaveResult = yield* leaveAction
+      .send('', peerIds)
+      .pipe(Effect.result)
+    if (sendLeaveResult._tag === 'Success') {
+      yield* Effect.sleep(99) // todo: determine if necessary
+    }
+    yield* Scope.close(
+      roomScope,
+      Exit.succeed(RoomPeerExitValue.RoomLeft({message: 'room left'}))
+    )
+    onSelfLeave()
+  })
+
   if (isBrowser) {
-    unregisterBeforeUnloadCleanup = registerBeforeUnloadCleanup(() =>
-      leave().catch(noOp)
+    yield* Effect.forkIn(roomScope)(
+      Stream.runDrain(
+        Stream.fromEventListener(globalThis.window, unloadEvent).pipe(
+          Stream.tap(() => leaveRoom),
+          Stream.take(1) // cleanup stream listener after first event
+        )
+      )
     )
   }
 
   return {
-    makeAction: actionManager.makeAction,
+    //@ts-ignore
+    makeAction: (...args: Parameters<Room['makeAction']>) => {
+      // temporary hack for `peer-lifecycle` disable auto-pong requirement.
+      // remove once actionManager has been updated.
+      if (args[0] === '@_ping') {
+        Fiber.interrupt(replyWithPongFiber).pipe(Effect.runSync)
+      }
+      return actionManager.makeAction(...args)
+    },
 
-    leave,
+    leave: () => leaveRoom.pipe(Effect.runPromise),
 
     ping: async id => {
       if (!activePeerMap[id]) {
@@ -352,7 +423,8 @@ const make = Effect.fnUntraced(function* (
 
         queue.push(waiter)
         void pingAction
-          .send('', id)
+          .send('', [id])
+          .pipe(Effect.runPromise)
           .catch(err => waiter.reject(toError(err, 'peer disconnected')))
       })
 
@@ -367,26 +439,21 @@ const make = Effect.fnUntraced(function* (
       ) as Record<string, RTCPeerConnection>,
 
     addStream: (stream, options: AddMediaOptions = {}) =>
-      mediaManager.addStream(stream, options, streamMetaAction.send),
+      mediaManager.addStream(stream, options, sendStreamMeta),
 
     removeStream: (stream, options = {}) => {
       mediaManager.removeStream(stream, options.target)
     },
 
     addTrack: (track, stream, options: AddMediaOptions = {}) =>
-      mediaManager.addTrack(track, stream, options, trackMetaAction.send),
+      mediaManager.addTrack(track, stream, options, sendTrackMeta),
 
     removeTrack: (track, options = {}) => {
       mediaManager.removeTrack(track, options.target)
     },
 
     replaceTrack: (oldTrack, newTrack, options: AddMediaOptions = {}) =>
-      mediaManager.replaceTrack(
-        oldTrack,
-        newTrack,
-        options,
-        trackMetaAction.send
-      ),
+      mediaManager.replaceTrack(oldTrack, newTrack, options, sendTrackMeta),
 
     get onPeerJoin() {
       return listeners.onPeerJoin
