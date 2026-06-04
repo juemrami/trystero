@@ -86,7 +86,7 @@ export type ProgressHandler = (
 
 export type ActionProgressContext = {
   peerId: string
-  metadata?: JsonValue
+  metadata?: JsonValue | undefined
 }
 
 export type ActionProgressHandler = (

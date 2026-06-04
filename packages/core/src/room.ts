@@ -7,7 +7,7 @@ import {
   mkErr,
   toError
 } from './utils'
-import {createActionManager} from './actions'
+import {PublicActionsManager} from './actions'
 import {HandshakeManager} from './handshake'
 import {createMediaManager, type InternalMediaMeta} from './media'
 import type {
@@ -25,7 +25,6 @@ import {
   Context,
   Effect,
   Exit,
-  Fiber,
   flow,
   Function,
   identity,
@@ -113,29 +112,18 @@ const make = Effect.fnUntraced(function* (
   )
   const PeerManagerCtx = Context.add(RoomScopeCtx, RoomPeerManager, peerManager)
 
-  const actionManager = createActionManager({
-    getPeer: (id, includePending) =>
-      (includePending ? peerMap : activePeerMap)[id],
-    getPeerIds: includePending =>
-      keys(includePending ? peerMap : activePeerMap),
-    canReceiveFromPeer: Effect.fn(function* (id, receiveWhilePending) {
-      const peer = yield* peerManager.get(id)
-      if (!peer) {
-        return false
-      }
-      return receiveWhilePending ? true : peer._tag === 'Active'
-    }, Effect.runSync)
-  })
-
-  const wireManager = yield* ActionWireManager.make({
-    onRegisteredPeerData: (...args) =>
-      Effect.sync(() => actionManager.handleData(...args))
-  }).pipe(Effect.provideContext(PeerManagerCtx))
+  const wireManager = yield* ActionWireManager.make().pipe(
+    Effect.provideContext(PeerManagerCtx)
+  )
 
   const ActionManagerCtx = Context.add(
     PeerManagerCtx,
     ActionWireManager,
     wireManager
+  )
+
+  const actionManager = yield* PublicActionsManager.make.pipe(
+    Effect.provideContext(ActionManagerCtx)
   )
 
   const handshakeManager = yield* HandshakeManager.make({
@@ -197,10 +185,6 @@ const make = Effect.fnUntraced(function* (
           PeerClosed: ({reason, peerId, wasActive}) =>
             Effect.sync(() => {
               delete activePeerMap[peerId]
-              actionManager.clearPeer(
-                peerId,
-                mkErr('peer disconnected: ' + reason)
-              )
               pendingPongs[peerId]
                 ?.splice(0)
                 .forEach(waiter => waiter.reject(mkErr('peer disconnected')))
@@ -224,8 +208,16 @@ const make = Effect.fnUntraced(function* (
       Stream.runDrain
     )
   )
+  // leak: the `peer-lifecycle` test requires ping to be a public action-
+  // so that it can be overwritten for the 'disable auto-pong' behavior
+  const pingAction = yield* actionManager
+    .makeMessageAction<string>(internalNs('ping'))
+    .pipe(Scope.provide(roomScope))
 
-  const pingAction = yield* makeActionInternal<string>(internalNs('ping'))
+  pingAction.onMessage = (_, {peerId}) =>
+    // auto-pong
+    pongAction.send('', [peerId]).pipe(Effect.asVoid, Effect.runPromise)
+
   const pongAction = yield* makeActionInternal<string>(internalNs('pong'))
   const signalAction = yield* makeActionInternal<Signal>(internalNs('signal'))
   const streamMetaAction = yield* makeActionInternal<InternalMediaMeta>(
@@ -238,11 +230,6 @@ const make = Effect.fnUntraced(function* (
     sendToPending: true,
     receiveWhilePending: true
   })
-
-  const replyWithPongFiber = yield* onWireReceivedListener({
-    wire: pingAction,
-    listener: (_, id) => pongAction.send('', [id])
-  }).pipe(Effect.forkIn(roomScope))
 
   yield* onWireReceivedListener({
     wire: pongAction,
@@ -370,15 +357,11 @@ const make = Effect.fnUntraced(function* (
   }
 
   return {
-    //@ts-ignore
-    makeAction: (...args: Parameters<Room['makeAction']>) => {
-      // temporary hack for `peer-lifecycle` disable auto-pong requirement.
-      // remove once actionManager has been updated.
-      if (args[0] === '@_ping') {
-        Fiber.interrupt(replyWithPongFiber).pipe(Effect.runSync)
-      }
-      return actionManager.makeAction(...args)
-    },
+    makeAction: flow(
+      actionManager.legacyMakeActionAdapter,
+      Scope.provide(roomScope),
+      Effect.runSync
+    ) as Room['makeAction'],
 
     leave: () => leaveRoom.pipe(Effect.runPromise),
 
@@ -423,8 +406,7 @@ const make = Effect.fnUntraced(function* (
 
         queue.push(waiter)
         void pingAction
-          .send('', [id])
-          .pipe(Effect.runPromise)
+          .send('', {target: [id]})
           .catch(err => waiter.reject(toError(err, 'peer disconnected')))
       })
 
